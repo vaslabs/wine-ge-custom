@@ -1,0 +1,153 @@
+From 9063694675eca4f5b4c9132de81a038662ab1639 Mon Sep 17 00:00:00 2001
+From: Vasilis Nicolaou <vasilis.nicolaou@vaslabs.io>
+Date: Sat, 11 Nov 2023 10:12:33 +0200
+Subject: [PATCH] Attempt to fix wineusb container id
+
+---
+ dlls/winebus.sys/Makefile.in |  2 +-
+ dlls/winebus.sys/bus_udev.c  | 35 +++++++++++++++++++++++++++++++++++
+ dlls/winebus.sys/main.c      | 36 ++++++++++++++++++++++++++++++++++++
+ dlls/winebus.sys/unixlib.h   |  1 +
+ 4 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winebus.sys/Makefile.in b/dlls/winebus.sys/Makefile.in
+index da02ae06870..9677d3b908e 100644
+--- a/dlls/winebus.sys/Makefile.in
++++ b/dlls/winebus.sys/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = winebus.sys
+ UNIXLIB   = winebus.so
+-IMPORTS   = ntoskrnl hidparse
++IMPORTS   = ntoskrnl hidparse ole32
+ UNIX_LIBS    = $(IOKIT_LIBS) $(UDEV_LIBS) $(PTHREAD_LIBS) $(INOTIFY_LIBS)
+ UNIX_CFLAGS  = $(UDEV_CFLAGS) $(SDL2_CFLAGS)
+ 
+diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
+index 5da979c6c5a..a9d49835ba6 100644
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1543,6 +1543,37 @@ static const struct hid_device_vtbl lnxev_device_vtbl =
+ };
+ #endif /* HAS_PROPER_INPUT_HEADER */
+ 
++
++static void get_device_container_syspath(const char *syspath, struct device_desc *desc)
++{
++    char path[MAX_PATH], buffer[10], *p;
++
++    if (strlen(syspath) + strlen("/removable") + 1 > MAX_PATH)
++        return;
++
++    strcpy(path, syspath);
++
++    while ((p = strrchr(path, '/'))) {
++        FILE *f;
++
++        strcpy(p, "/removable");
++        f = fopen(path, "r");
++        *p = 0;
++
++        if (f) {
++            if (fgets(buffer, 10, f) && strcmp(buffer, "fixed") != 0) {
++                /* It's a potentially removable device, so treat it as a container */
++                fclose(f);
++                break;
++            }
++            fclose(f);
++        }
++    }
++
++    if (p && (p - path) > 12)
++        lstrcpynA(desc->container_syspath, path, sizeof(desc->container_syspath));
++}
++
+ static void get_device_subsystem_info(struct udev_device *dev, char const *subsystem, struct device_desc *desc,
+                                       int *bus)
+ {
+@@ -1601,6 +1632,10 @@ static void get_device_subsystem_info(struct udev_device *dev, char const *subsy
+ 
+     if (!desc->serialnumber[0] && (tmp = udev_device_get_sysattr_value(dev, "serial")))
+         ntdll_umbstowcs(tmp, strlen(tmp) + 1, desc->serialnumber, ARRAY_SIZE(desc->serialnumber));
++
++    if (!desc->container_syspath[0] && (tmp = udev_device_get_syspath(dev))) {
++        get_device_container_syspath(tmp, desc);
++    }
+ }
+ 
+ static void hidraw_set_quirks(struct hidraw_device *impl, DWORD bus_type, WORD vid, WORD pid)
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index d1f9e45cf02..6223aa7f863 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -37,6 +37,7 @@
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ #include "wine/unixlib.h"
++#include "ole2.h"
+ 
+ #include "unixlib.h"
+ 
+@@ -219,6 +220,37 @@ static WCHAR *get_device_id(DEVICE_OBJECT *device)
+     return dst;
+ }
+ 
++static WCHAR *get_container_id(DEVICE_OBJECT *device)
++{
++    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
++    UINT len = (38+1)*sizeof(WCHAR);
++    WCHAR *dst;
++    GUID guid;
++    const char *p;
++
++    if (!ext->desc.container_syspath[0])
++        return NULL;
++
++    memset(&guid, 0, sizeof(GUID));
++    guid.Data1 = (ext->desc.vid << 16) | ext->desc.pid;
++
++    /* Get just the USB bus-devpath part */
++    p = strrchr(ext->desc.container_syspath, '/');
++    if (!p || (p - ext->desc.container_syspath) <= 12)
++        return NULL;
++
++    for (int i = 0; p[i]; i++) {
++      ((char *) &guid)[4 + i % 12] ^= p[i];
++    }
++
++    if (!(dst = ExAllocatePool(PagedPool, len)))
++        return NULL;
++
++    StringFromGUID2(&guid, dst, len);
++    return dst;
++}
++
++
+ static WCHAR *get_hardware_ids(DEVICE_OBJECT *device)
+ {
+     static const WCHAR input_format[] = L"&MI_%02u";
+@@ -522,6 +554,10 @@ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
+             TRACE("BusQueryInstanceID\n");
+             irp->IoStatus.Information = (ULONG_PTR)get_instance_id(device);
+             break;
++        case BusQueryContainerID:
++            TRACE("BusQueryContainerID\n");
++            irp->IoStatus.Information = (ULONG_PTR)get_container_id(device);
++            break;
+         default:
+             FIXME("Unhandled type %08x\n", type);
+             return status;
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+index 68d59ac0333..944c1d375c7 100644
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -42,6 +42,7 @@ struct device_desc
+     WCHAR manufacturer[MAX_PATH];
+     WCHAR product[MAX_PATH];
+     WCHAR serialnumber[MAX_PATH];
++    char container_syspath[MAX_PATH];
+ };
+ 
+ struct sdl_bus_options
+-- 
+2.41.0
+
